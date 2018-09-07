@@ -611,34 +611,32 @@ FindPgEntrySig(
     CHAR SdbpCheckDll[] =
         "48 8b 74 24 30 48 8b 7c 24 28 4c 8b 54 24 38 33 c0 49 89 02 49 83 ea 08 4c 3b d4 73 f4 48 89 7c 24 28 8b d8 8b f8 8b e8 4c 8b d0 4c 8b d8 4c 8b e0 4c 8b e8 4c 8b f0 4c 8b f8 ff e6";
 
-    if (NULL != LargePoolTableLock) {
-        Irql = ExAcquireSpinLockShared(LargePoolTableLock);
+    Irql = ExAcquireSpinLockShared(LargePoolTableLock);
 
-        for (Index = 0;
-            Index < PoolBigPageTableSize;
-            Index++) {
-            if (POOL_BIG_TABLE_ENTRY_FREE != FlagOn(
-                (ULONG64)PoolBigPageTable[Index].Va,
-                POOL_BIG_TABLE_ENTRY_FREE)) {
-                if (NonPagedPool == NtosMmDeterminePoolType(PoolBigPageTable[Index].Va)) {
-                    if (PoolBigPageTable[Index].NumberOfPages > PgNtSectionSize) {
-                        if ((ULONG64)VirtualAddress >= (ULONG64)PoolBigPageTable[Index].Va &&
-                            (ULONG64)VirtualAddress < (ULONG64)PoolBigPageTable[Index].Va +
-                            PoolBigPageTable[Index].NumberOfPages) {
-                            ControlPc = ScanBytes(
-                                PoolBigPageTable[Index].Va,
-                                (PCHAR)PoolBigPageTable[Index].Va + PoolBigPageTable[Index].NumberOfPages,
-                                SdbpCheckDll);
+    for (Index = 0;
+        Index < PoolBigPageTableSize;
+        Index++) {
+        if (POOL_BIG_TABLE_ENTRY_FREE != FlagOn(
+            (ULONG64)PoolBigPageTable[Index].Va,
+            POOL_BIG_TABLE_ENTRY_FREE)) {
+            if (NonPagedPool == NtosMmDeterminePoolType(PoolBigPageTable[Index].Va)) {
+                if (PoolBigPageTable[Index].NumberOfPages > PgNtSectionSize) {
+                    if ((ULONG64)VirtualAddress >= (ULONG64)PoolBigPageTable[Index].Va &&
+                        (ULONG64)VirtualAddress < (ULONG64)PoolBigPageTable[Index].Va +
+                        PoolBigPageTable[Index].NumberOfPages) {
+                        ControlPc = ScanBytes(
+                            PoolBigPageTable[Index].Va,
+                            (PCHAR)PoolBigPageTable[Index].Va + PoolBigPageTable[Index].NumberOfPages,
+                            SdbpCheckDll);
 
-                            break;
-                        }
+                        break;
                     }
                 }
             }
         }
-
-        ExReleaseSpinLockShared(LargePoolTableLock, Irql);
     }
+
+    ExReleaseSpinLockShared(LargePoolTableLock, Irql);
 
     return ControlPc;
 }
@@ -724,7 +722,7 @@ PgSetEncodeEntry(
 VOID
 NTAPI
 PgClearContext(
-    __in ULONG_PTR Argument
+    VOID
 )
 {
     PCHAR TargetPc = NULL;
@@ -732,135 +730,138 @@ PgClearContext(
     ULONG64 RorKey = 0;
     PULONG64 Field = NULL;
     PVOID PgContext = NULL;
+    KIRQL Irql = 0;
 
-    if (0 == KeGetCurrentProcessorNumber()) {
-        for (Index = 0;
-            Index < PoolBigPageTableSize;
-            Index++) {
-            if (POOL_BIG_TABLE_ENTRY_FREE != FlagOn(
-                (ULONG64)PoolBigPageTable[Index].Va,
-                POOL_BIG_TABLE_ENTRY_FREE)) {
-                if (NonPagedPool == NtosMmDeterminePoolType(PoolBigPageTable[Index].Va)) {
-                    if (PoolBigPageTable[Index].NumberOfPages > PgNtSectionSize) {
-                        TargetPc = PoolBigPageTable[Index].Va;
+    Irql = ExAcquireSpinLockShared(LargePoolTableLock);
 
-                        while ((ULONG64)TargetPc <
-                            (ULONG64)PoolBigPageTable[Index].Va +
-                            PoolBigPageTable[Index].NumberOfPages - PgAppendSectionSize) {
-                            Field = TargetPc;
+    for (Index = 0;
+        Index < PoolBigPageTableSize;
+        Index++) {
+        if (POOL_BIG_TABLE_ENTRY_FREE != FlagOn(
+            (ULONG64)PoolBigPageTable[Index].Va,
+            POOL_BIG_TABLE_ENTRY_FREE)) {
+            if (NonPagedPool == NtosMmDeterminePoolType(PoolBigPageTable[Index].Va)) {
+                if (PoolBigPageTable[Index].NumberOfPages > PgNtSectionSize) {
+                    TargetPc = PoolBigPageTable[Index].Va;
 
-                            if ((ULONG64)Field == (ULONG64)&PgContextField) {
-                                break;
-                            }
+                    while ((ULONG64)TargetPc <
+                        (ULONG64)PoolBigPageTable[Index].Va +
+                        PoolBigPageTable[Index].NumberOfPages - PgAppendSectionSize) {
+                        Field = TargetPc;
 
-                            RorKey = Field[3] ^ PgContextField[3];
+                        if ((ULONG64)Field == (ULONG64)&PgContextField) {
+                            break;
+                        }
 
-                            if (0 == RorKey) {
-                                if (Field[2] == PgContextField[2] &&
-                                    Field[1] == PgContextField[1] &&
-                                    Field[0] == PgContextField[0]) {
-                                    PgContext = TargetPc - PG_FIELD_OFFSET;
+                        RorKey = Field[3] ^ PgContextField[3];
+
+                        if (0 == RorKey) {
+                            if (Field[2] == PgContextField[2] &&
+                                Field[1] == PgContextField[1] &&
+                                Field[0] == PgContextField[0]) {
+                                PgContext = TargetPc - PG_FIELD_OFFSET;
 
 #ifndef VMP
-                                    DbgPrint(
-                                        "Soul - Testis - found decode pg context at < %p >\n",
-                                        PgContext);
+                                DbgPrint(
+                                    "Soul - Testis - found decode pg context at < %p >\n",
+                                    PgContext);
 #endif // !VMP
-                                    break;
-                                }
+                                break;
                             }
-                            else {
-                                RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS);
+                        }
+                        else {
+                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS);
+
+                            if (FALSE != PgIsBtcEncode) {
+                                RorKey = _btc64(RorKey, RorKey);
+                            }
+
+                            if ((ULONG64)(Field[2] ^ RorKey) == (ULONG64)PgContextField[2]) {
+                                RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 1);
 
                                 if (FALSE != PgIsBtcEncode) {
                                     RorKey = _btc64(RorKey, RorKey);
                                 }
 
-                                if ((ULONG64)(Field[2] ^ RorKey) == (ULONG64)PgContextField[2]) {
-                                    RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 1);
+                                if ((ULONG64)(Field[1] ^ RorKey) == (ULONG64)PgContextField[1]) {
+                                    RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 2);
 
                                     if (FALSE != PgIsBtcEncode) {
                                         RorKey = _btc64(RorKey, RorKey);
                                     }
 
-                                    if ((ULONG64)(Field[1] ^ RorKey) == (ULONG64)PgContextField[1]) {
-                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 2);
+                                    if ((ULONG64)(Field[0] ^ RorKey) == (ULONG64)PgContextField[0]) {
+                                        PgContext = TargetPc - PG_FIELD_OFFSET;
+
+                                        RorKey = __ROR64(Field[0] ^ PgContextField[0], PG_FIELD_ROL_BITS - 3);
 
                                         if (FALSE != PgIsBtcEncode) {
                                             RorKey = _btc64(RorKey, RorKey);
                                         }
 
-                                        if ((ULONG64)(Field[0] ^ RorKey) == (ULONG64)PgContextField[0]) {
-                                            PgContext = TargetPc - PG_FIELD_OFFSET;
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 4);
 
-                                            RorKey = __ROR64(Field[0] ^ PgContextField[0], PG_FIELD_ROL_BITS - 3);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 4);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 5);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 6);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 7);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 8);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 9);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 10);
-
-                                            if (FALSE != PgIsBtcEncode) {
-                                                RorKey = _btc64(RorKey, RorKey);
-                                            }
-
-                                            DbgPrint(
-                                                "Soul - Testis - found encode pg context at < %p > RorKey < %p >\n",
-                                                PgContext,
-                                                RorKey);
-
-                                            PgSetEncodeEntry(PgContext, RorKey);
-
-                                            break;
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
                                         }
+
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 5);
+
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
+                                        }
+
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 6);
+
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
+                                        }
+
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 7);
+
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
+                                        }
+
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 8);
+
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
+                                        }
+
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 9);
+
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
+                                        }
+
+                                        RorKey = __ROR64(RorKey, PG_FIELD_ROL_BITS - 10);
+
+                                        if (FALSE != PgIsBtcEncode) {
+                                            RorKey = _btc64(RorKey, RorKey);
+                                        }
+
+                                        DbgPrint(
+                                            "Soul - Testis - found encode pg context at < %p > RorKey < %p >\n",
+                                            PgContext,
+                                            RorKey);
+
+                                        PgSetEncodeEntry(PgContext, RorKey);
+
+                                        break;
                                     }
                                 }
                             }
-
-                            TargetPc++;
                         }
+
+                        TargetPc++;
                     }
                 }
             }
         }
     }
+
+    ExReleaseSpinLockShared(LargePoolTableLock, Irql);
 }
 
 VOID
@@ -959,6 +960,8 @@ PgClearWorker(
         InitialStack--;
     }
 
+    PgClearContext();
+
 retry:
     Buffer = ExAllocatePool(
         NonPagedPool,
@@ -983,29 +986,33 @@ retry:
                     ThreadInfo = (PSYSTEM_EXTENDED_THREAD_INFORMATION)
                         (ProcessInfo + 1);
 
-                    for (Index = 0;
-                        Index < ProcessInfo->NumberOfThreads;
-                        Index++) {
-                        if ((ULONG64)PsGetCurrentThreadId() ==
-                            (ULONG64)ThreadInfo[Index].ThreadInfo.ClientId.UniqueThread) {
-                            NtosExpWorkerThread = ThreadInfo[Index].Win32StartAddress;
+                    if (NULL == NtosExpWorkerThread) {
+                        for (Index = 0;
+                            Index < ProcessInfo->NumberOfThreads;
+                            Index++) {
+                            if ((ULONG64)PsGetCurrentThreadId() ==
+                                (ULONG64)ThreadInfo[Index].ThreadInfo.ClientId.UniqueThread) {
+                                NtosExpWorkerThread = ThreadInfo[Index].Win32StartAddress;
 
-                            break;
+                                break;
+                            }
                         }
                     }
 
-                    for (Index = 0;
-                        Index < ProcessInfo->NumberOfThreads;
-                        Index++) {
-                        if ((ULONG64)PsGetCurrentThreadId() !=
-                            (ULONG64)ThreadInfo[Index].ThreadInfo.ClientId.UniqueThread &&
-                            (ULONG64)NtosExpWorkerThread ==
-                            (ULONG64)ThreadInfo[Index].Win32StartAddress) {
-                            RemoteCall(
-                                ThreadInfo[Index].ThreadInfo.ClientId.UniqueThread,
-                                IMAGE_NT_OPTIONAL_HDR_MAGIC,
-                                (PUSER_THREAD_START_ROUTINE)PgSetDecodeEntry,
-                                NULL);
+                    if (NULL != NtosExpWorkerThread) {
+                        for (Index = 0;
+                            Index < ProcessInfo->NumberOfThreads;
+                            Index++) {
+                            if ((ULONG64)PsGetCurrentThreadId() !=
+                                (ULONG64)ThreadInfo[Index].ThreadInfo.ClientId.UniqueThread &&
+                                (ULONG64)NtosExpWorkerThread ==
+                                (ULONG64)ThreadInfo[Index].Win32StartAddress) {
+                                RemoteCall(
+                                    ThreadInfo[Index].ThreadInfo.ClientId.UniqueThread,
+                                    IMAGE_NT_OPTIONAL_HDR_MAGIC,
+                                    (PUSER_THREAD_START_ROUTINE)PgSetDecodeEntry,
+                                    NULL);
+                            }
                         }
                     }
 
@@ -1069,10 +1076,6 @@ DisPg(
         0 != PoolBigPageTableSize &&
         NULL != LargePoolTableLock&&
         NULL != NtosMmDeterminePoolType) {
-        KeIpiGenericCall(
-            (PKIPI_BROADCAST_WORKER)PgClearContext,
-            (ULONG_PTR)0);
-
         KeInitializeEvent(
             &Notify,
             SynchronizationEvent,
