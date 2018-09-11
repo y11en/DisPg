@@ -964,9 +964,6 @@ IsIndependentPages(
 {
     BOOLEAN Result = FALSE;
     PRTL_BITMAP Bitmap = NULL;
-    KIRQL OldIrql = 0;
-
-    MiLockSystemSpace(OldIrql);
 
     Bitmap = FindSystemPageBitmap();
 
@@ -979,8 +976,6 @@ IsIndependentPages(
             }
         }
     }
-
-    MiUnlockSystemSpace(OldIrql);
 
     return Result;
 }
@@ -995,9 +990,6 @@ PgClearPagesContext(
     PMMPTE PointerPte = NULL;
     ULONG Index = 0;
     PVOID VirtualAddress = NULL;
-    KIRQL OldIrql = 0;
-
-    MiLockSystemSpace(OldIrql);
 
     Bitmap = FindSystemPageBitmap();
 
@@ -1024,8 +1016,6 @@ PgClearPagesContext(
             }
         }
     }
-
-    MiUnlockSystemSpace(OldIrql);
 }
 
 VOID
