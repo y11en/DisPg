@@ -37,8 +37,6 @@
 #define PG_FIELD_ROL_BITS 11
 #define PG_MAX_FOUND 10
 
-#define PFN_BASE ((PMMPFN)(ULONG_PTR)0xFFFFFA8000000000UI64)
-
 static PEX_SPIN_LOCK LargePoolTableLock;
 static PPOOL_BIG_PAGES PoolBigPageTable;
 static SIZE_T PoolBigPageTableSize;
@@ -48,15 +46,15 @@ static ULONG PgEntryRvaOffset;
 static ULONG PgAppendSectionSize;
 static PVOID PgAppendSection;
 static ULONG PgNtSectionSize;
+
+// context field may be 0
+
 static ULONG64 PgContextField[4];
 static WORK_QUEUE_ITEM PgClearWorkerItem;
 
-static struct {
-    PRTL_BITMAP Bitmap;
-    PMMPTE BasePte;
-}NtosMiKernelStackPteInfo;
-
 PVOID NtosExpWorkerContext;
+
+static ULONG_PTR PteBase;
 
 POOL_TYPE
 (NTAPI * NtosMmDeterminePoolType)(
@@ -108,6 +106,25 @@ NTAPI
 _RevertWorkerThreadToSelf(
     VOID
 );
+
+PMMPTE
+NTAPI
+GetPteAddress(
+    __in PVOID VirtualAddress
+)
+{
+    PMMPTE PointerPte = NULL;
+    PFN_NUMBER Number = 0;
+
+    if (0 != PteBase) {
+        PointerPte = (PMMPTE)
+            ((((ULONG_PTR)VirtualAddress & VIRTUAL_ADDRESS_MASK) >> PTI_SHIFT) << PTE_SHIFT);
+
+        PointerPte = (PMMPTE)(PteBase + (ULONG_PTR)PointerPte);
+    }
+
+    return PointerPte;
+}
 
 ULONG64
 NTAPI
@@ -170,8 +187,9 @@ SetPgContextField(
     CHAR PgEntrySig[] = "48 81 ec c0 02 00 00 48 8d a8 d8 fd ff ff 48 83 e5 80";
     CHAR KiStartSystemThreadSig[] = "b9 01 00 00 00 44 0f 22 c1 48 8b 14 24 48 8b 4c 24 08 ff 54 24 10";
     CHAR PspSystemThreadStartupSig[] = "eb ?? b9 1e 00 00 00 e8";
+
+    // if os build > win10 (10586) PteBase and PdeBase is random;
     CHAR MiGetPteAddressSig[] = "48 c1 e9 09 48 b8 f8 ff ff ff 7f 00 00 00 48 23 c8 48 b8 ?? ?? ?? ?? ?? ?? ?? ?? 48 03 c1 c3";
-    CHAR MiGetPdeAddressSig[] = "48 c1 e9 12 81 e1 f8 ff ff 3f 48 b8 ?? ?? ?? ?? ?? ?? ?? ?? 48 03 c1 c3";
 
     ImageBase = GetImageHandle("ntoskrnl.exe");
 
@@ -424,35 +442,24 @@ SetPgContextField(
                             MiGetPteAddressSig);
 
                         if (NULL != ControlPc) {
-                            TargetPc = ControlPc;
+                            TargetPc = (PVOID)
+                                (ControlPc - (ULONG64)ViewBase + (ULONG64)ImageBase);
 
-                            NtosMiGetPteAddress = (PVOID)
-                                (TargetPc - (ULONG64)ViewBase + (ULONG64)ImageBase);
-
+                            PteBase = *(PULONG_PTR)(TargetPc + 19);
 #ifndef VMP
                             DbgPrint(
-                                "Soul - Testis - < %p > MiGetPteAddress\n",
-                                NtosMiGetPteAddress);
+                                "Soul - Testis - < %p > PteBase\n",
+                                PteBase);
 #endif // !VMP
                         }
-
-                        ControlPc = ScanBytes(
-                            ViewBase,
-                            (PCHAR)ViewBase + ViewSize,
-                            MiGetPdeAddressSig);
-
-                        if (NULL != ControlPc) {
-                            TargetPc = ControlPc;
-
-                            NtosMiGetPdeAddress = (PVOID)
-                                (TargetPc - (ULONG64)ViewBase + (ULONG64)ImageBase);
-
+                    }
+                    else {
+                        PteBase = 0xFFFFF68000000000UI64;
 #ifndef VMP
-                            DbgPrint(
-                                "Soul - Testis - < %p > MiGetPdeAddress\n",
-                                NtosMiGetPdeAddress);
+                        DbgPrint(
+                            "Soul - Testis - < %p > PteBase\n",
+                            PteBase);
 #endif // !VMP
-                        }
                     }
 
                     ZwUnmapViewOfSection(
@@ -724,6 +731,10 @@ PgSetEncodeEntry(
     ULONG Index = 0;
     PCHAR ControlPc = NULL;
 
+    // xor encode must be align 8 byte;
+
+    // get pg entry offset in encode code
+
     FieldIndex = (PgEntryRvaOffset -
         PgAppendSectionSize) / sizeof(ULONG64);
 
@@ -741,6 +752,8 @@ PgSetEncodeEntry(
 
     EntryRva = *(PULONG)((PCHAR)&FieldBuffer + (PgEntryRvaOffset & 7));
 
+    // copy pg entry head code to temp bufer and decode
+
     FieldIndex = (EntryRva - PgAppendSectionSize) / sizeof(ULONG64);
 
     RtlCopyMemory(
@@ -755,6 +768,8 @@ PgSetEncodeEntry(
         FieldBuffer[Index] = FieldBuffer[Index] ^ LastRorKey;
     }
 
+    // set temp buffer pg entry head jmp to _PgEncodeClear an encode
+
     ControlPc = (PCHAR)&FieldBuffer + (EntryRva & 7);
 
     BuildJumpCode(
@@ -767,6 +782,9 @@ PgSetEncodeEntry(
         LastRorKey = GetKeyOffset(RorKey, FieldIndex + Index);
         FieldBuffer[Index] = FieldBuffer[Index] ^ LastRorKey;
     }
+
+    // copy temp buffer pg entry head to old address, 
+    // when PatchGuard code decode self jmp _PgEncodeClear.
 
     RtlCopyMemory(
         (PCHAR)PgContext + (EntryRva & ~7),
@@ -800,6 +818,14 @@ PgClearEncodeContext(
         }
 
         RorKey = Field[3] ^ PgContextField[3];
+
+        // loc_140D6DECD : ; CODE XREF : CmpAppendDllSection + 98¡ýj
+        // xor [rdx + rcx * 8 + 0C0h], rax
+        // ror rax, cl
+
+        // if >= win10 17134 btc rax, rax here
+
+        // loop loc_140D6DECD
 
         if (0 == RorKey) {
             if (Field[2] == PgContextField[2] &&
@@ -941,6 +967,7 @@ FindSystemPageBitmap(
                         TargetPc = RVA_TO_VA(ControlPc + 3);
 
                         if (FALSE != MmIsAddressValid(TargetPc)) {
+                            // MiKernelStackPteInfo->Header
                             Bitmap = TargetPc;
                         }
 
@@ -968,12 +995,10 @@ IsIndependentPages(
     Bitmap = FindSystemPageBitmap();
 
     if (NULL != Bitmap) {
-        if (FALSE != MmIsAddressValid(VirtualAddress)) {
-            if ((ULONG_PTR)VirtualAddress >= (ULONG_PTR)Bitmap->Buffer &&
-                (ULONG_PTR)VirtualAddress <
-                (ULONG_PTR)Bitmap->Buffer + PAGE_SIZE * Bitmap->SizeOfBitMap * 8) {
-                Result = TRUE;
-            }
+        if ((ULONG_PTR)VirtualAddress >= (ULONG_PTR)Bitmap->Buffer &&
+            (ULONG_PTR)VirtualAddress <
+            (ULONG_PTR)Bitmap->Buffer + PAGE_SIZE * Bitmap->SizeOfBitMap * 8) {
+            Result = TRUE;
         }
     }
 
@@ -987,32 +1012,73 @@ PgClearPagesContext(
 )
 {
     PRTL_BITMAP Bitmap = NULL;
+    PMMPTE PteBegin = NULL;
     PMMPTE PointerPte = NULL;
-    ULONG Index = 0;
-    PVOID VirtualAddress = NULL;
+    PFN_NUMBER NumberOfPtes = 0;
+    SIZE_T Index = 0;
 
     Bitmap = FindSystemPageBitmap();
 
     if (NULL != Bitmap) {
+        PteBegin = GetPteAddress(Bitmap->Buffer);
+
+        ASSERT(NULL != PteBegin);
+
+        NumberOfPtes = Bitmap->SizeOfBitMap -
+            BYTES_TO_PAGES(((ULONG_PTR)Bitmap->Buffer & MAXULONG));
+
+        /*
+        PatchGuard pages allocate by MmAllocateIndependentPages
+
+        PTEs fields like this
+
+        nt!_MMPTE
+            [+0x000] Long             : 0x2da963 [Type: unsigned __int64]
+            [+0x000] VolatileLong     : 0x2da963 [Type: unsigned __int64]
+            [+0x000] Hard             [Type: _MMPTE_HARDWARE]
+
+                [+0x000 ( 0: 0)] Valid            : 0x1 [Type: unsigned __int64] <- valid
+                [+0x000 ( 1: 1)] Dirty1           : 0x1 [Type: unsigned __int64] <-
+                [+0x000 ( 2: 2)] Owner            : 0x0 [Type: unsigned __int64]
+                [+0x000 ( 3: 3)] WriteThrough     : 0x0 [Type: unsigned __int64]
+                [+0x000 ( 4: 4)] CacheDisable     : 0x0 [Type: unsigned __int64]
+                [+0x000 ( 5: 5)] Accessed         : 0x1 [Type: unsigned __int64] <-
+                [+0x000 ( 6: 6)] Dirty            : 0x1 [Type: unsigned __int64] <-
+                [+0x000 ( 7: 7)] LargePage        : 0x0 [Type: unsigned __int64]
+                [+0x000 ( 8: 8)] Global           : 0x1 [Type: unsigned __int64] <- kernel pte
+                [+0x000 ( 9: 9)] CopyOnWrite      : 0x0 [Type: unsigned __int64]
+                [+0x000 (10:10)] Unused           : 0x0 [Type: unsigned __int64]
+                [+0x000 (11:11)] Write            : 0x1 [Type: unsigned __int64] <- page writable
+                [+0x000 (47:12)] PageFrameNumber  : 0x2da [Type: unsigned __int64] <- pfn index
+                [+0x000 (51:48)] reserved1        : 0x0 [Type: unsigned __int64]
+                [+0x000 (62:52)] SoftwareWsIndex  : 0x0 [Type: unsigned __int64]
+                [+0x000 (63:63)] NoExecute        : 0x0 [Type: unsigned __int64] <- page executable
+
+            [+0x000] Flush            [Type: _HARDWARE_PTE]
+            [+0x000] Proto            [Type: _MMPTE_PROTOTYPE]
+            [+0x000] Soft             [Type: _MMPTE_SOFTWARE]
+            [+0x000] TimeStamp        [Type: _MMPTE_TIMESTAMP]
+            [+0x000] Trans            [Type: _MMPTE_TRANSITION]
+            [+0x000] Subsect          [Type: _MMPTE_SUBSECTION]
+            [+0x000] List             [Type: _MMPTE_LIST]
+        */
+
+#define VALID_PTE 0x0000000000000963UI64
+#define VALID_PTE_EX 0xFFFF00000000069CUI64
+
         for (Index = 0;
-            Index < Bitmap->SizeOfBitMap * 8; // 1 Byte = 8 Bits
+            Index < NumberOfPtes;
             Index++) {
-            VirtualAddress = (PCHAR)Bitmap->Buffer + PAGE_SIZE * Index;
+            PointerPte = PteBegin + Index;
 
-            if (FALSE != MmIsAddressValid(VirtualAddress)) {
-                if (OsBuildNumber < 10586) {
-                    PointerPte = MiGetPteAddress(VirtualAddress);
-                }
-                else {
-                    if (NULL != NtosMiGetPteAddress) {
-                        PointerPte = NtosMiGetPteAddress(VirtualAddress);
-                    }
-                }
+            if (VALID_PTE == (PointerPte->u.Long & VALID_PTE) &&
+                0 == (PointerPte->u.Long & VALID_PTE_EX)) {
+                // here must be lock with mdl,
+                // I'm in no image.
 
-                if (TRUE == PointerPte->u.Hard.Global &&
-                    FALSE == PointerPte->u.Hard.NoExecute) {
-                    PgClearEncodeContext(VirtualAddress, PAGE_SIZE);
-                }
+                PgClearEncodeContext(
+                    (PCHAR)Bitmap->Buffer + PAGE_SIZE * Index,
+                    PAGE_SIZE);
             }
         }
     }
@@ -1089,10 +1155,15 @@ PgSetDecodeEntry(
 
             InitialStack = IoGetInitialStack();
 
+            // all worker thread start at KiStartSystemThread and return address == 0
+            // if null != last return address code is in noimage
+
             if (NULL != Callers[Count - 1].Establisher) {
                 DbgPrint(
                     "Soul - Testis - < %p > found noimage return address in worker\n",
                     Callers[Count - 1].Establisher);
+
+                // scan pg entry code in region
 
                 ControlPc = FindBigPoolPgEntrySig(Callers[Count - 1].Establisher);
 
@@ -1104,7 +1175,18 @@ PgSetDecodeEntry(
                     for (TargetPc = (PULONG64)Callers[Count - 1].EstablisherFrame;
                         (ULONG64)TargetPc < (ULONG64)InitialStack;
                         TargetPc++) {
+                        // In most cases, PatchGuard code will wait for a random time.
+                        // set return address in current thread stack to _RevertWorkerThreadToSelf
+                        // than PatchGuard code was not continue
+
                         if ((ULONG64)*TargetPc == (ULONG64)Callers[Count - 1].Establisher) {
+                            // restart ExpWorkerThread
+
+                            // ExFrame->P1Home = (ULONG64)NtosExpWorkerContext;
+                            // ExFrame->P2Home = (ULONG64)NtosExpWorkerThread;
+                            // ExFrame->P3Home = (ULONG64)NtosPspSystemThreadStartup;
+                            // ExFrame->Return = (ULONG64)NtosKiStartSystemThread; <- jmp function return address == 0
+
                             *TargetPc = (ULONG64)_RevertWorkerThreadToSelf;
 
                             DbgPrint(
@@ -1114,7 +1196,11 @@ PgSetDecodeEntry(
                         }
                     }
                 }
-                else{
+                else {
+                    // independent pages length is not easy to determine
+                    // and MmAllocateIndependentPages not export
+                    // so check address in independent pages region
+
                     if (FALSE != IsIndependentPages(Callers[Count - 1].Establisher)) {
                         DbgPrint(
                             "Soul - Testis - < %p > return address in independent pages\n",
@@ -1156,6 +1242,11 @@ PgClearWorker(
     ULONG Index = 0;
     PULONG64 InitialStack = 0;
     PKPRIQUEUE WorkPriQueue = NULL;
+
+    // if os build < 9600 NtosExpWorkerContext = (0 or 1) 
+    // else NtosExpWorkerContext = struct _KPRIQUEUE 
+    //      (0x15 == WorkPriQueue->Header.Type && 
+    //      0xac == WorkPriQueue->Header.Hand)
 
     InitialStack = IoGetInitialStack();
     NtosExpWorkerContext = UlongToPtr(CriticalWorkQueue);
@@ -1269,11 +1360,12 @@ DisPg(
 {
     KEVENT Notify = { 0 };
 
+    // after PatchGuard logic is interrupted not trigger again.
+    // so no need to continue running.
+
     if (0 == PgEntryRvaOffset ||
         0 == PgAppendSectionSize ||
-        0 == PgNtSectionSize ||
-        0 == PgContextField[0] ||
-        0 == PgContextField[1]) {
+        0 == PgNtSectionSize) {
         SetPgContextField();
     }
 
@@ -1287,8 +1379,6 @@ DisPg(
         0 != PgAppendSectionSize &&
         NULL != PgAppendSection &&
         0 != PgNtSectionSize &&
-        0 != PgContextField[0] &&
-        0 != PgContextField[1] &&
         NULL != PoolBigPageTable &&
         0 != PoolBigPageTableSize &&
         NULL != LargePoolTableLock&&
