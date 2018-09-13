@@ -125,24 +125,6 @@ GetPteAddress(
     return PointerPte;
 }
 
-PMMPTE
-NTAPI
-GetPdeAddress(
-    __in PVOID VirtualAddress
-)
-{
-    PMMPTE PointerPde = NULL;
-
-    if (0 != PdeBase) {
-        PointerPde = (PMMPTE)
-            ((((ULONG_PTR)VirtualAddress & VIRTUAL_ADDRESS_MASK) >> PDI_SHIFT) << PTE_SHIFT);
-
-        PointerPde = (PMMPTE)(PteBase + (ULONG_PTR)PointerPde);
-    }
-
-    return PointerPde;
-}
-
 PVOID
 NTAPI
 GetVirtualAddressMappedByPte(
@@ -224,7 +206,6 @@ SetPgContextField(
 
     // if os build > win10 (10586) PteBase and PdeBase is random;
     CHAR MiGetPteAddressSig[] = "48 c1 e9 09 48 b8 f8 ff ff ff 7f 00 00 00 48 23 c8 48 b8 ?? ?? ?? ?? ?? ?? ?? ?? 48 03 c1 c3";
-    CHAR MiGetPdeAddressSig[] = "48 c1 e9 12 81 e1 f8 ff ff 3f 48 b8 ?? ?? ?? ?? ?? ?? ?? ?? 48 03 c1 c3";
 
     ImageBase = GetImageHandle("ntoskrnl.exe");
 
@@ -488,24 +469,6 @@ SetPgContextField(
                                 PteBase);
 #endif // !VMP
                         }
-
-                        ControlPc = ScanBytes(
-                            ViewBase,
-                            (PCHAR)ViewBase + ViewSize,
-                            MiGetPdeAddressSig);
-
-                        if (NULL != ControlPc) {
-                            TargetPc = (PVOID)
-                                (ControlPc - (ULONG64)ViewBase + (ULONG64)ImageBase);
-
-                            PteBase = *(PULONG_PTR)(TargetPc + 12);
-
-#ifndef VMP
-                            DbgPrint(
-                                "Soul - Testis - < %p > PdeBase\n",
-                                PdeBase);
-#endif // !VMP
-                        }
                     }
                     else {
                         PteBase = PTE_BASE;
@@ -514,14 +477,6 @@ SetPgContextField(
                         DbgPrint(
                             "Soul - Testis - < %p > PteBase\n",
                             PteBase);
-#endif // !VMP
-
-                        PdeBase = PDE_BASE;
-
-#ifndef VMP
-                        DbgPrint(
-                            "Soul - Testis - < %p > PdeBase\n",
-                            PdeBase);
 #endif // !VMP
                     }
 
