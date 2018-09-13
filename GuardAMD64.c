@@ -27,7 +27,6 @@
 #include "Scan.h"
 #include "Stack.h"
 #include "Testis.h"
-#include "Thread.h"
 
 #define __ROL64(x, n) (((x) << ((n % 64))) | ((x) >> (64 - (n % 64))))
 #define __ROR64(x, n) (((x) >> ((n % 64))) | ((x) << (64 - (n % 64))))
@@ -55,6 +54,7 @@ static WORK_QUEUE_ITEM PgClearWorkerItem;
 PVOID NtosExpWorkerContext;
 
 static ULONG_PTR PteBase;
+static ULONG_PTR PdeBase;
 
 POOL_TYPE
 (NTAPI * NtosMmDeterminePoolType)(
@@ -114,7 +114,6 @@ GetPteAddress(
 )
 {
     PMMPTE PointerPte = NULL;
-    PFN_NUMBER Number = 0;
 
     if (0 != PteBase) {
         PointerPte = (PMMPTE)
@@ -124,6 +123,41 @@ GetPteAddress(
     }
 
     return PointerPte;
+}
+
+PMMPTE
+NTAPI
+GetPdeAddress(
+    __in PVOID VirtualAddress
+)
+{
+    PMMPTE PointerPde = NULL;
+
+    if (0 != PdeBase) {
+        PointerPde = (PMMPTE)
+            ((((ULONG_PTR)VirtualAddress & VIRTUAL_ADDRESS_MASK) >> PDI_SHIFT) << PTE_SHIFT);
+
+        PointerPde = (PMMPTE)(PteBase + (ULONG_PTR)PointerPde);
+    }
+
+    return PointerPde;
+}
+
+PVOID
+NTAPI
+GetVirtualAddressMappedByPte(
+    __in PMMPTE Pte
+)
+{
+    PVOID VirtualAddress = NULL;
+    LONG_PTR Index = 0;
+
+    Index = (LONG_PTR)Pte - PteBase;
+
+    VirtualAddress = (PVOID)
+        ((LONG_PTR)(Index << (PAGE_SHIFT + VA_SHIFT - PTE_SHIFT)) >> VA_SHIFT);
+
+    return VirtualAddress;
 }
 
 ULONG64
@@ -190,6 +224,7 @@ SetPgContextField(
 
     // if os build > win10 (10586) PteBase and PdeBase is random;
     CHAR MiGetPteAddressSig[] = "48 c1 e9 09 48 b8 f8 ff ff ff 7f 00 00 00 48 23 c8 48 b8 ?? ?? ?? ?? ?? ?? ?? ?? 48 03 c1 c3";
+    CHAR MiGetPdeAddressSig[] = "48 c1 e9 12 81 e1 f8 ff ff 3f 48 b8 ?? ?? ?? ?? ?? ?? ?? ?? 48 03 c1 c3";
 
     ImageBase = GetImageHandle("ntoskrnl.exe");
 
@@ -446,19 +481,47 @@ SetPgContextField(
                                 (ControlPc - (ULONG64)ViewBase + (ULONG64)ImageBase);
 
                             PteBase = *(PULONG_PTR)(TargetPc + 19);
+
 #ifndef VMP
                             DbgPrint(
                                 "Soul - Testis - < %p > PteBase\n",
                                 PteBase);
 #endif // !VMP
                         }
+
+                        ControlPc = ScanBytes(
+                            ViewBase,
+                            (PCHAR)ViewBase + ViewSize,
+                            MiGetPdeAddressSig);
+
+                        if (NULL != ControlPc) {
+                            TargetPc = (PVOID)
+                                (ControlPc - (ULONG64)ViewBase + (ULONG64)ImageBase);
+
+                            PteBase = *(PULONG_PTR)(TargetPc + 12);
+
+#ifndef VMP
+                            DbgPrint(
+                                "Soul - Testis - < %p > PdeBase\n",
+                                PdeBase);
+#endif // !VMP
+                        }
                     }
                     else {
-                        PteBase = 0xFFFFF68000000000UI64;
+                        PteBase = PTE_BASE;
+
 #ifndef VMP
                         DbgPrint(
                             "Soul - Testis - < %p > PteBase\n",
                             PteBase);
+#endif // !VMP
+
+                        PdeBase = PDE_BASE;
+
+#ifndef VMP
+                        DbgPrint(
+                            "Soul - Testis - < %p > PdeBase\n",
+                            PdeBase);
 #endif // !VMP
                     }
 
@@ -1012,73 +1075,67 @@ PgClearPagesContext(
 )
 {
     PRTL_BITMAP Bitmap = NULL;
-    PMMPTE PteBegin = NULL;
     PMMPTE PointerPte = NULL;
-    PFN_NUMBER NumberOfPtes = 0;
+    PVOID VirtualAddress = NULL;
     SIZE_T Index = 0;
 
-    Bitmap = FindSystemPageBitmap();
+    /*
+    PatchGuard pages allocate by MmAllocateIndependentPages
 
-    if (NULL != Bitmap) {
-        PteBegin = GetPteAddress(Bitmap->Buffer);
+    PTEs fields like this
 
-        ASSERT(NULL != PteBegin);
+    nt!_MMPTE
+    [+0x000] Long             : 0x2da963 [Type: unsigned __int64]
+    [+0x000] VolatileLong     : 0x2da963 [Type: unsigned __int64]
+    [+0x000] Hard             [Type: _MMPTE_HARDWARE]
 
-        NumberOfPtes = Bitmap->SizeOfBitMap -
-            BYTES_TO_PAGES(((ULONG_PTR)Bitmap->Buffer & MAXULONG));
+        [+0x000 ( 0: 0)] Valid            : 0x1 [Type: unsigned __int64] <- valid
+        [+0x000 ( 1: 1)] Dirty1           : 0x1 [Type: unsigned __int64] <-
+        [+0x000 ( 2: 2)] Owner            : 0x0 [Type: unsigned __int64]
+        [+0x000 ( 3: 3)] WriteThrough     : 0x0 [Type: unsigned __int64]
+        [+0x000 ( 4: 4)] CacheDisable     : 0x0 [Type: unsigned __int64]
+        [+0x000 ( 5: 5)] Accessed         : 0x1 [Type: unsigned __int64] <-
+        [+0x000 ( 6: 6)] Dirty            : 0x1 [Type: unsigned __int64] <-
+        [+0x000 ( 7: 7)] LargePage        : 0x0 [Type: unsigned __int64]
+        [+0x000 ( 8: 8)] Global           : 0x1 [Type: unsigned __int64] <- kernel pte
+        [+0x000 ( 9: 9)] CopyOnWrite      : 0x0 [Type: unsigned __int64]
+        [+0x000 (10:10)] Unused           : 0x0 [Type: unsigned __int64]
+        [+0x000 (11:11)] Write            : 0x1 [Type: unsigned __int64] <- page writable
+        [+0x000 (47:12)] PageFrameNumber  : 0x2da [Type: unsigned __int64] <- pfn index
+        [+0x000 (51:48)] reserved1        : 0x0 [Type: unsigned __int64]
+        [+0x000 (62:52)] SoftwareWsIndex  : 0x0 [Type: unsigned __int64]
+        [+0x000 (63:63)] NoExecute        : 0x0 [Type: unsigned __int64] <- page executable
 
-        /*
-        PatchGuard pages allocate by MmAllocateIndependentPages
-
-        PTEs fields like this
-
-        nt!_MMPTE
-            [+0x000] Long             : 0x2da963 [Type: unsigned __int64]
-            [+0x000] VolatileLong     : 0x2da963 [Type: unsigned __int64]
-            [+0x000] Hard             [Type: _MMPTE_HARDWARE]
-
-                [+0x000 ( 0: 0)] Valid            : 0x1 [Type: unsigned __int64] <- valid
-                [+0x000 ( 1: 1)] Dirty1           : 0x1 [Type: unsigned __int64] <-
-                [+0x000 ( 2: 2)] Owner            : 0x0 [Type: unsigned __int64]
-                [+0x000 ( 3: 3)] WriteThrough     : 0x0 [Type: unsigned __int64]
-                [+0x000 ( 4: 4)] CacheDisable     : 0x0 [Type: unsigned __int64]
-                [+0x000 ( 5: 5)] Accessed         : 0x1 [Type: unsigned __int64] <-
-                [+0x000 ( 6: 6)] Dirty            : 0x1 [Type: unsigned __int64] <-
-                [+0x000 ( 7: 7)] LargePage        : 0x0 [Type: unsigned __int64]
-                [+0x000 ( 8: 8)] Global           : 0x1 [Type: unsigned __int64] <- kernel pte
-                [+0x000 ( 9: 9)] CopyOnWrite      : 0x0 [Type: unsigned __int64]
-                [+0x000 (10:10)] Unused           : 0x0 [Type: unsigned __int64]
-                [+0x000 (11:11)] Write            : 0x1 [Type: unsigned __int64] <- page writable
-                [+0x000 (47:12)] PageFrameNumber  : 0x2da [Type: unsigned __int64] <- pfn index
-                [+0x000 (51:48)] reserved1        : 0x0 [Type: unsigned __int64]
-                [+0x000 (62:52)] SoftwareWsIndex  : 0x0 [Type: unsigned __int64]
-                [+0x000 (63:63)] NoExecute        : 0x0 [Type: unsigned __int64] <- page executable
-
-            [+0x000] Flush            [Type: _HARDWARE_PTE]
-            [+0x000] Proto            [Type: _MMPTE_PROTOTYPE]
-            [+0x000] Soft             [Type: _MMPTE_SOFTWARE]
-            [+0x000] TimeStamp        [Type: _MMPTE_TIMESTAMP]
-            [+0x000] Trans            [Type: _MMPTE_TRANSITION]
-            [+0x000] Subsect          [Type: _MMPTE_SUBSECTION]
-            [+0x000] List             [Type: _MMPTE_LIST]
-        */
+    [+0x000] Flush            [Type: _HARDWARE_PTE]
+    [+0x000] Proto            [Type: _MMPTE_PROTOTYPE]
+    [+0x000] Soft             [Type: _MMPTE_SOFTWARE]
+    [+0x000] TimeStamp        [Type: _MMPTE_TIMESTAMP]
+    [+0x000] Trans            [Type: _MMPTE_TRANSITION]
+    [+0x000] Subsect          [Type: _MMPTE_SUBSECTION]
+    [+0x000] List             [Type: _MMPTE_LIST]
+    */
 
 #define VALID_PTE 0x0000000000000963UI64
 #define VALID_PTE_EX 0xFFFF00000000069CUI64
 
+    Bitmap = FindSystemPageBitmap();
+
+    if (NULL != Bitmap) {
         for (Index = 0;
-            Index < NumberOfPtes;
+            Index < Bitmap->SizeOfBitMap;
             Index++) {
-            PointerPte = PteBegin + Index;
+            VirtualAddress = (PCHAR)Bitmap->Buffer + PAGE_SIZE * Index;
 
-            if (VALID_PTE == (PointerPte->u.Long & VALID_PTE) &&
-                0 == (PointerPte->u.Long & VALID_PTE_EX)) {
-                // here must be lock with mdl,
-                // I'm in no image.
+            if (FALSE != MmIsAddressValid(VirtualAddress)) {
+                PointerPte = GetPteAddress(VirtualAddress);
 
-                PgClearEncodeContext(
-                    (PCHAR)Bitmap->Buffer + PAGE_SIZE * Index,
-                    PAGE_SIZE);
+                if (VALID_PTE == (PointerPte->u.Long & VALID_PTE) &&
+                    0 == (PointerPte->u.Long & VALID_PTE_EX)) {
+                    // here must be lock with mdl,
+                    // I'm in noimage.
+
+                    PgClearEncodeContext(VirtualAddress, PAGE_SIZE);
+                }
             }
         }
     }
