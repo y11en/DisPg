@@ -1,11 +1,12 @@
-#Turn off PatchGuard in real time for win7 (7600) ~ win10 (17134).\<br>
-\<br>
+#Turn off PatchGuard in real time for win7 (7600) ~ win10 (17134).
+ 
 ![Image text](https://github.com/9176324/DisPg/blob/master/attach%20PatchGuard.png)
-\<br>
-#Test for BigPool.\<br>
-\<br>
+ 
+#Test for BigPool.
+ 
 ![Image text](https://github.com/9176324/DisPg/blob/master/BigPool.png)
-\<br>
-#Test for pages and worker.\<br>
-\<br>
+ 
+#Test for pages and worker.
+ 
 ![Image text](https://github.com/9176324/DisPg/blob/master/PagesAndWorker.png)
+ 
